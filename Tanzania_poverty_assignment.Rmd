@@ -1,0 +1,134 @@
+---
+title: "Tanzania Poverty Assignment"
+author: "Group: A.Sychevska"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(haven)      # read_dta
+install.packages("janitor")
+library(janitor)
+library(survey) # survey-weighted design objects
+```
+
+# Notes
+
+Two Stata files in the working directory:
+
+- `Tanzania_2012.dta`
+- `Tanzania_2018.dta`
+
+It computes the three Foster–Greer–Thorbecke (FGT) poverty measures (headcount P0, poverty gap P1, squared poverty gap P2) at:
+
+- national level
+- by stratum (STRATUM: rural, other urban, Dar es Salaam)
+- by region
+
+For **two poverty lines**: `povline` and `food_povline` contained in the datasets.
+
+It uses household sampling weights (`hhweight`) and household size (`hhsize`) to compute *population (person-level) measures*.
+
+---
+
+## 1. Helper functions
+
+```{r helpers}
+fgt_measures <- function(cons, hhweight, hhsize, z){
+  cons <- as.numeric(cons)
+  hhweight <- as.numeric(hhweight)
+  hhsize <- as.numeric(hhsize)
+  
+  pw <- hhweight * hhsize
+  N_pop <- sum(pw, na.rm = TRUE)
+  
+  poor <- pmax(0, z - cons)
+  
+  P0 <- sum(pw * (cons < z), na.rm = TRUE) / N_pop
+  P1 <- sum(pw * (poor / z), na.rm = TRUE) / N_pop
+  P2 <- sum(pw * ((poor / z)^2), na.rm = TRUE) / N_pop
+  
+  tibble(P0 = P0, P1 = P1, P2 = P2, N_pop = N_pop)
+}
+
+compute_grouped_fgt <- function(df, group_var, z_var){
+  df %>%
+    group_by(across(all_of(group_var))) %>%
+    summarise(res = list(fgt_measures(cons = cons, hhweight = hhweight, hhsize = hhsize, z = unique(!!sym(z_var)))),
+              .groups = "drop") %>%
+    unnest(res)
+}
+```
+
+---
+
+## 2. Read data
+
+```{r read-data}
+d12 <- read_dta("Tanzania_2012.dta") %>% clean_names()
+d18 <- read_dta("Tanzania_2018.dta") %>% clean_names()
+
+glimpse(d12)
+glimpse(d18)
+```
+
+---
+
+## 3. Prepare datasets
+
+```{r prep}
+keep_vars <- c("stratum","hhweight","region","hhsize","cons","povline","food_povline","year","hhid","cluster")
+
+d12 <- d12 %>% select(any_of(keep_vars)) %>% mutate(year = 2012)
+d18 <- d18 %>% select(any_of(keep_vars)) %>% mutate(year = 2018)
+
+dall <- bind_rows(d12, d18)
+```
+
+---
+
+## 4. National-level FGT
+
+```{r national-fgt}
+compute_national <- function(df, z_var){
+  z <- df[[z_var]]
+  z_val <- unique(na.omit(z))[1]
+  fgt_measures(cons = df$cons, hhweight = df$hhweight, hhsize = df$hhsize, z = z_val) %>%
+    mutate(z_var = z_var, z = z_val)
+}
+
+nat12_pov <- compute_national(d12, "povline") %>% mutate(year = 2012, line = "povline")
+nat12_food <- compute_national(d12, "food_povline") %>% mutate(year = 2012, line = "food_povline")
+nat18_pov <- compute_national(d18, "povline") %>% mutate(year = 2018, line = "povline")
+nat18_food <- compute_national(d18, "food_povline") %>% mutate(year = 2018, line = "food_povline")
+
+national_results <- bind_rows(nat12_pov, nat12_food, nat18_pov, nat18_food)
+national_results %>% knitr::kable(digits = 4)
+```
+
+---
+
+## 5. FGT by stratum and region
+
+```{r stratum-region}
+# by stratum
+stratum_results <- dall %>%
+  group_by(year, stratum) %>%
+  summarise(P0 = mean(cons < povline), .groups = "drop")
+
+# by region (can extend similar to above)
+region_results <- dall %>%
+  group_by(year, region) %>%
+  summarise(P0 = mean(cons < povline), .groups = "drop")
+
+
+stratum_results
+
+region_results
+```
