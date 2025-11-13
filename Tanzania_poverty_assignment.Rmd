@@ -1,134 +1,470 @@
 ---
-title: "Tanzania Poverty Assignment"
-author: "Group: A.Sychevska"
-date: "`r Sys.Date()`"
+title: "Tanzania Poverty Measurement (2012 vs 2018)"
+author: "Group: Alona Sycheska"
 output:
   html_document:
     toc: true
-    toc_depth: 2
+    toc_depth: 3
     df_print: paged
+    number_sections: true
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
-library(tidyverse)
-library(haven)      # read_dta
-install.packages("janitor")
-library(janitor)
-library(survey) # survey-weighted design objects
+  library(tidyverse)
+  library(haven)      # read Stata .dta
+  library(scales)
+  library(knitr)
+  library(kableExtra)
+  library(ggrepel)
 ```
 
-# Notes
+# Data & Methods
 
-Two Stata files in the working directory:
-
+## Files and variables
+The provided HHBS extracts:
 - `Tanzania_2012.dta`
 - `Tanzania_2018.dta`
 
-It computes the three Foster–Greer–Thorbecke (FGT) poverty measures (headcount P0, poverty gap P1, squared poverty gap P2) at:
+Key variables:
+- `STRATUM` (stratum: rural, other urban, Dar es Salaam)  
+- `hhweight` (household sampling weight)  
+- `region` (region name)  
+- `hhsize` (household size)  
+- `cons` (consumption per equivalent adult — welfare indicator)  
+- `povline` (standard poverty line)  
+- `food_povline` (food poverty line)  
+- `year` (survey year)  
+- plus other descriptive variables (e.g., `sex_hhh`, `educlevel_hhh`)
 
-- national level
-- by stratum (STRATUM: rural, other urban, Dar es Salaam)
-- by region
+Per the assignment, we weight *people*, not households: person weight = `hhweight * hhsize`.
 
-For **two poverty lines**: `povline` and `food_povline` contained in the datasets.
+## Load data
+```{r load-data}
+d12 <- read_dta("Tanzania_2012.dta") %>% mutate(year = 2012)
+d18 <- read_dta("Tanzania_2018.dta") %>% mutate(year = 2018)
 
-It uses household sampling weights (`hhweight`) and household size (`hhsize`) to compute *population (person-level) measures*.
+# Keep common columns, ensure character for grouping vars
+common_cols <- intersect(names(d12), names(d18))
+d12 <- d12 %>% select(all_of(common_cols))
+d18 <- d18 %>% select(all_of(common_cols))
 
----
+dall <- bind_rows(d12, d18) %>%
+  mutate(
+    region   = as.character(region),
+    STRATUM  = as.character(STRATUM),
+    hhsize   = as.numeric(hhsize),
+    hhweight = as.numeric(hhweight),
+    cons     = as.numeric(cons),
+    povline  = as.numeric(povline),
+    food_povline = as.numeric(food_povline),
+    pw       = hhweight * hhsize   # person-weight
+  ) %>%
+  filter(!is.na(cons), !is.na(pw), pw > 0)
 
-## 1. Helper functions
+# Quick peek
+dall %>% count(year) %>% kable() %>% kable_styling(full_width = FALSE)
+```
 
-```{r helpers}
-fgt_measures <- function(cons, hhweight, hhsize, z){
-  cons <- as.numeric(cons)
-  hhweight <- as.numeric(hhweight)
-  hhsize <- as.numeric(hhsize)
-  
-  pw <- hhweight * hhsize
-  N_pop <- sum(pw, na.rm = TRUE)
-  
-  poor <- pmax(0, z - cons)
-  
-  P0 <- sum(pw * (cons < z), na.rm = TRUE) / N_pop
-  P1 <- sum(pw * (poor / z), na.rm = TRUE) / N_pop
-  P2 <- sum(pw * ((poor / z)^2), na.rm = TRUE) / N_pop
-  
-  tibble(P0 = P0, P1 = P1, P2 = P2, N_pop = N_pop)
+## FGT definitions
+Foster–Greer–Thorbecke measures with weighted data. For a poverty line `z`, welfare `y`, weights `w`:
+
+- Headcount: \( P_0 = \frac{\sum w \cdot I(y<z)}{\sum w} \)
+- Poverty gap: \( P_1 = \frac{\sum w \cdot ((z - y)/z) \cdot I(y<z)}{\sum w} \)
+- Squared gap: \( P_2 = \frac{\sum w \cdot ((z - y)/z)^2 \cdot I(y<z)}{\sum w} \)
+
+```{r fgt-funs}
+fgt_vec <- function(y, z, w, alpha = 0) {
+  poor <- y < z & !is.na(y) & !is.na(z)
+  if (!any(poor, na.rm = TRUE)) return(0)
+  gap <- pmax(0, (z - y) / z)
+  num <- sum(w * (gap ^ alpha) * poor, na.rm = TRUE)
+  den <- sum(w, na.rm = TRUE)
+  if (den == 0) return(NA_real_)
+  num / den
 }
 
-compute_grouped_fgt <- function(df, group_var, z_var){
-  df %>%
-    group_by(across(all_of(group_var))) %>%
-    summarise(res = list(fgt_measures(cons = cons, hhweight = hhweight, hhsize = hhsize, z = unique(!!sym(z_var)))),
-              .groups = "drop") %>%
-    unnest(res)
+fgt_all <- function(df, zvar = "povline", w = "pw", y = "cons") {
+  z <- df[[zvar]]
+  yv <- df[[y]]
+  ww <- df[[w]]
+  tibble(
+    P0 = fgt_vec(yv, z, ww, 0),
+    P1 = fgt_vec(yv, z, ww, 1),
+    P2 = fgt_vec(yv, z, ww, 2)
+  )
 }
 ```
 
----
+# Results
 
-## 2. Read data
-
-```{r read-data}
-d12 <- read_dta("Tanzania_2012.dta") %>% clean_names()
-d18 <- read_dta("Tanzania_2018.dta") %>% clean_names()
-
-glimpse(d12)
-glimpse(d18)
-```
-
----
-
-## 3. Prepare datasets
-
-```{r prep}
-keep_vars <- c("stratum","hhweight","region","hhsize","cons","povline","food_povline","year","hhid","cluster")
-
-d12 <- d12 %>% select(any_of(keep_vars)) %>% mutate(year = 2012)
-d18 <- d18 %>% select(any_of(keep_vars)) %>% mutate(year = 2018)
-
-dall <- bind_rows(d12, d18)
-```
-
----
-
-## 4. National-level FGT
-
+## A) National poverty (standard and food lines)
 ```{r national-fgt}
-compute_national <- function(df, z_var){
-  z <- df[[z_var]]
-  z_val <- unique(na.omit(z))[1]
-  fgt_measures(cons = df$cons, hhweight = df$hhweight, hhsize = df$hhsize, z = z_val) %>%
-    mutate(z_var = z_var, z = z_val)
-}
+nat_std <- dall %>% group_by(year) %>%
+  group_modify(~ fgt_all(.x, zvar = "povline")) %>% ungroup() %>%
+  mutate(line = "Standard")
 
-nat12_pov <- compute_national(d12, "povline") %>% mutate(year = 2012, line = "povline")
-nat12_food <- compute_national(d12, "food_povline") %>% mutate(year = 2012, line = "food_povline")
-nat18_pov <- compute_national(d18, "povline") %>% mutate(year = 2018, line = "povline")
-nat18_food <- compute_national(d18, "food_povline") %>% mutate(year = 2018, line = "food_povline")
+nat_food <- dall %>% group_by(year) %>%
+  group_modify(~ fgt_all(.x, zvar = "food_povline")) %>% ungroup() %>%
+  mutate(line = "Food")
 
-national_results <- bind_rows(nat12_pov, nat12_food, nat18_pov, nat18_food)
-national_results %>% knitr::kable(digits = 4)
+nat_all <- bind_rows(nat_std, nat_food) %>%
+  select(year, line, P0, P1, P2)
+
+kable(nat_all %>% mutate(across(P0:P2, ~ percent(., accuracy = 0.1)))) %>%
+  kable_styling(full_width = FALSE)
 ```
 
----
+```{r national}
+# NATIONAL POVERTY INDICES (P0, P1, P2)
+# for both the standard and food lines
 
-## 5. FGT by stratum and region
+# Standard poverty line
+nat_std <- dall %>%
+  group_by(year) %>%
+  summarise(
+    total_weight = sum(pw, na.rm = TRUE),
+    P0 = sum(pw[cons < povline], na.rm = TRUE) / total_weight,
+    P1 = sum(pw * ((povline - cons) / povline) * (cons < povline), na.rm = TRUE) / total_weight,
+    P2 = sum(pw * ((povline - cons) / povline)^2 * (cons < povline), na.rm = TRUE) / total_weight
+  ) %>%
+  mutate(line = "Standard")
 
-```{r stratum-region}
-# by stratum
-stratum_results <- dall %>%
-  group_by(year, stratum) %>%
-  summarise(P0 = mean(cons < povline), .groups = "drop")
+# Food poverty line
+nat_food <- dall %>%
+  group_by(year) %>%
+  summarise(
+    total_weight = sum(pw, na.rm = TRUE),
+    P0 = sum(pw[cons < food_povline], na.rm = TRUE) / total_weight,
+    P1 = sum(pw * ((food_povline - cons) / food_povline) * (cons < food_povline), na.rm = TRUE) / total_weight,
+    P2 = sum(pw * ((food_povline - cons) / food_povline)^2 * (cons < food_povline), na.rm = TRUE) / total_weight
+  ) %>%
+  mutate(line = "Food")
 
-# by region (can extend similar to above)
-region_results <- dall %>%
+nat_all <- bind_rows(nat_std, nat_food)
+
+# Display results
+kable(nat_all %>% mutate(across(P0:P2, ~ percent(., 0.1))),
+      caption = "National poverty indices (P0, P1, P2) by year and poverty line") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Interpretation
+```{r nat-summary, echo=FALSE}
+nat_std_tbl <- nat_std %>% arrange(year)
+
+interp_text <- paste0(
+  "Between 2012 and 2018: Headcount (P0) fell from ",
+  percent(nat_std_tbl$P0[1], 0.1), " to ", percent(nat_std_tbl$P0[2], 0.1),
+  "; Poverty gap (P1) from ", percent(nat_std_tbl$P1[1], 0.1), " to ", percent(nat_std_tbl$P1[2], 0.1),
+  "; and Squared gap (P2) from ", percent(nat_std_tbl$P2[1], 0.1), " to ", percent(nat_std_tbl$P2[2], 0.1), "."
+)
+
+# print without quotes or prefixes
+cat(interp_text, sep = "\n")
+```
+
+## B) Stratum poverty (rural, other urban, Dar es Salaam)
+```{r stratum-fgt}
+stratum_std <- dall %>% group_by(year, STRATUM) %>%
+  group_modify(~ fgt_all(.x, zvar = "povline")) %>% ungroup() %>%
+  mutate(line = "Standard")
+
+stratum_food <- dall %>% group_by(year, STRATUM) %>%
+  group_modify(~ fgt_all(.x, zvar = "food_povline")) %>% ungroup() %>%
+  mutate(line = "Food")
+
+stratum_all <- bind_rows(stratum_std, stratum_food)
+kable(stratum_all %>% arrange(year, line, STRATUM) %>%
+        mutate(across(P0:P2, ~ percent(., accuracy = 0.1)))) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r stratum}
+# STRATUM-LEVEL POVERTY (Rural, Other Urban, Dar es Salaam)
+
+stratum_all <- dall %>%
+  group_by(year, STRATUM) %>%
+  summarise(
+    total_weight = sum(pw, na.rm = TRUE),
+    P0 = sum(pw[cons < povline], na.rm = TRUE) / total_weight,
+    P1 = sum(pw * ((povline - cons) / povline) * (cons < povline), na.rm = TRUE) / total_weight,
+    P2 = sum(pw * ((povline - cons) / povline)^2 * (cons < povline), na.rm = TRUE) / total_weight
+  )
+
+kable(stratum_all %>% mutate(across(P0:P2, ~ percent(., 0.1))),
+      caption = "Stratum-level poverty indices (Standard Line)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Interpretation
+```{r stratum-summary, echo=FALSE}
+interp_text <- paste0(
+  
+"•The stratum-level results reveal clear spatial differences in poverty dynamics between 2012 and 2018. Poverty in rural areas declines modestly, with the headcount falling from 33.3% to 31.4%, supported by small reductions in the poverty gap and severity. This indicates a gradual improvement in rural welfare, although the pace remains limited.\n",
+
+"•In other urban areas, poverty also decreases, from 21.7% to 19.2%, suggesting that secondary urban centers experienced continued economic gains and relatively inclusive growth during the period.\n",
+
+"•In contrast, Dar es Salaam exhibits a sharp increase in poverty, with the headcount doubling from 4.1% to 8.0%. This deterioration, together with rising P1 and P2, suggests that the city faces growing vulnerability—potentially due to rising living costs, pressure on labor markets, or uneven distribution of urban growth benefits.\n",
+
+"•Overall, the results highlight diverging welfare trajectories: rural and secondary urban areas show gradual progress, while the main metropolitan region experiences a notable reversal."
+)
+
+cat(interp_text, sep = "\n")
+```
+
+## C) Region poverty
+```{r region-fgt}
+region_std <- dall %>% group_by(year, region) %>%
+  group_modify(~ fgt_all(.x, zvar = "povline")) %>% ungroup() %>%
+  mutate(line = "Standard")
+
+region_food <- dall %>% group_by(year, region) %>%
+  group_modify(~ fgt_all(.x, zvar = "food_povline")) %>% ungroup() %>%
+  mutate(line = "Food")
+
+region_all <- bind_rows(region_std, region_food)
+
+# Show a few rows (table can be long)
+kable(region_all %>% arrange(year, line, region) %>%
+        mutate(across(P0:P2, ~ percent(., accuracy = 0.1))) %>%
+        group_by(year, line) %>% slice_head(n = 15) %>% ungroup(),
+      caption = "Region-level poverty (first 15 rows per year/line)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r region}
+# REGION-LEVEL POVERTY (P0, P1, P2)
+
+region_all <- dall %>%
   group_by(year, region) %>%
-  summarise(P0 = mean(cons < povline), .groups = "drop")
+  summarise(
+    total_weight = sum(pw, na.rm = TRUE),
+    P0 = sum(pw[cons < povline], na.rm = TRUE) / total_weight,
+    P1 = sum(pw * ((povline - cons) / povline) * (cons < povline), na.rm = TRUE) / total_weight,
+    P2 = sum(pw * ((povline - cons) / povline)^2 * (cons < povline), na.rm = TRUE) / total_weight
+  )
 
+kable(region_all %>% mutate(across(P0:P2, ~ percent(., 0.1))) %>% head(15),
+      caption = "Regional poverty indices (first 15 rows)") %>%
+  kable_styling(full_width = FALSE)
+```
+### Interpretation
+```{r region-summary, echo=FALSE}
+interp_text <- paste0(
+  "• Regional results show heterogeneity: some areas improve, others worsen.\n",
+  "• This confirms that national averages can hide large geographic disparities in poverty outcomes."
+)
 
-stratum_results
+cat(interp_text, sep = "\n")
+```
 
-region_results
+# Visualization: National Trends
+
+```{r plot, fig.height=8, fig.width=10}
+# PLOT NATIONAL POVERTY INDICES
+# PLOT NATIONAL POVERTY INDICES
+nat_all %>%
+  pivot_longer(P0:P2, names_to = "Indicator", values_to = "Value") %>%
+  ggplot(aes(x = factor(year), y = Value, color = Indicator, group = Indicator)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  facet_wrap(~ line) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    breaks = seq(0, 0.35, by = 0.02)   # <<< clearer axis
+  ) +
+  labs(
+    title = "National Poverty Indices (2012 vs 2018)",
+    subtitle = "Headcount (P0), Poverty Gap (P1), Squared Gap (P2)",
+    x = "Survey Year",
+    y = "Value",
+    color = "Indicator"
+  ) +
+  theme_minimal()
+
+```
+
+# Contributions to national headcount
+
+Compute the contribution (share) of each stratum/region to the **national number of poor people**, using the **standard** line. (Repeat similarly for the food line)
+
+```{r contrib-funs}
+contrib_share <- function(df, zvar = "povline", w = "pw", y = "cons", group_vars) {
+  z <- df[[zvar]]; yv <- df[[y]]; ww <- df[[w]]
+  df %>%
+    mutate(poor = as.integer(yv < z)) %>%
+    group_by(across(all_of(c("year", group_vars)))) %>%
+    summarise(poor_pop = sum(ww * poor, na.rm = TRUE), .groups = "drop") %>%
+    group_by(year) %>%
+    mutate(contrib_share = poor_pop / sum(poor_pop)) %>%
+    ungroup()
+}
+
+stratum_contrib <- contrib_share(dall, zvar = "povline", group_vars = "STRATUM")
+region_contrib  <- contrib_share(dall, zvar = "povline", group_vars = "region")
+
+kable(stratum_contrib %>% arrange(year, desc(contrib_share)) %>%
+        mutate(contrib_share = percent(contrib_share, 0.1)),
+      caption = "Stratum contribution to national poor (standard line)") %>%
+  kable_styling(full_width = FALSE)
+
+kable(region_contrib %>% group_by(year) %>%
+        arrange(year, desc(contrib_share), .by_group = TRUE) %>%
+        slice_head(n = 15) %>% ungroup() %>%
+        mutate(contrib_share = percent(contrib_share, 0.1)),
+      caption = "Top 15 region contributions to national poor (standard line)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+# Policy Note
+
+## Q1. How has poverty evolved between 2012 and 2018?
+```{r echo=FALSE}
+cat("Between 2012 and 2018: Headcount (P0) fell from 28.2% to 26.4%; Poverty gap (P1) from 6.7% to 6.2%; and Squared gap (P2) from 2.3% to 2.1%.")
+```
+
+## Q2. Is the trend at national level the same by stratum?
+```{r echo=FALSE}
+cat("No — the national poverty trend does not mirror the pattern observed across strata.
+Although poverty falls modestly at the national level between 2012 and 2018 (from 28.2% to 26.4%), the three strata exhibit different trajectories:
+
+Rural areas show a small decline in poverty (from 33.3% to 31.4%), broadly consistent with the national trend but at a higher level.
+
+Other Urban areas also experience a decline (from 21.7% to 19.2%), showing more progress than the national average.
+
+Dar es Salaam, however, moves in the opposite direction, with poverty increasing from 4.1% to 8.0%.
+
+These results indicate that national averages obscure substantial spatial heterogeneity. Some strata improve faster than the national trend, while the capital city experiences a clear deterioration. Therefore, the national pattern does not hold uniformly across settlement types.")
+```
+
+## Q3. Is the trend observed at the national level the same at the level of each region??
+```{r region_plot_all, results='asis', fig.width=12, fig.height=6}
+# Prepare national
+nat_for_plot <- nat_std %>%
+  mutate(region = "National") %>%
+  select(year, region, P0, P1, P2)
+
+# Combine
+region_plus_nat <- bind_rows(
+  region_all %>% mutate(region = as.character(region)),
+  nat_for_plot
+)
+
+# Pivot long
+region_long <- region_plus_nat %>%
+  pivot_longer(
+    cols = c(P0, P1, P2),
+    names_to = "Indicator",
+    values_to = "Value"
+  )
+
+# For labels
+region_labels <- region_long %>%
+  filter(year == 2018)
+
+# Number of regions
+n_regions <- n_distinct(region_long$region)
+
+ggplot(region_long,
+       aes(x = factor(year),
+           y = Value,
+           group = region,
+           color = region)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  geom_text_repel(
+    data = region_labels,
+    aes(label = region),
+    nudge_x = 0.25,
+    size = 3,
+    direction = "y",
+    hjust = 0,
+    segment.color = NA
+  ) +
+  facet_wrap(~ Indicator, scales = "free_y") +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    breaks = seq(0, 0.60, by = 0.05)
+  ) +
+  scale_color_manual(values = rainbow(n_regions, s = 0.8, v = 0.9)) +  # <<< NEW COLORS
+  labs(
+    title = "Regional and National Poverty Trends (P0, P1, P2)",
+    subtitle = "Standard Poverty Line",
+    x = "Survey Year",
+    y = "Poverty Measure",
+    color = "Region"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    legend.key.size = unit(0.3, "cm"),
+    legend.text = element_text(size = 7)
+  )
+
+cat("The national poverty indicators show a modest decline between 2012 and 2018, but regional trends diverge substantially from this aggregate pattern. Several regions experience strong reductions in poverty, while others show limited progress or even increases. For example, Regions 1, 12, and 20 improve markedly, whereas Regions 13, 14, and 21 record rising poverty rates under the standard line. This heterogeneity indicates that national improvements mask significant regional disparities, and poverty reduction has not been spatially uniform.")
+```
+
+## Q4. Are trends robust across P0, P1, P2 and the food line?
+```{r echo=FALSE}
+cat("At the national level, poverty trends are robust across all indicators and both poverty lines: between 2012 and 2018, P0, P1, and P2 all decline slightly under the standard line (e.g., headcount from 28.2% to 26.4%) and similarly under the food line (P0 from 9.7% to 8.0%). This indicates a consistent national improvement.
+
+However, this robustness does not hold uniformly at lower geographic levels. For example, Dar es Salaam shows increases across all three indicators (P0 rises from 4.1% to 8.0%), while rural and other urban areas show mild but consistent declines. At the regional level, results diverge even more: some regions improve across all indicators (e.g., Region 1, where P0 falls from 34.6% to 23.2%), whereas others worsen (e.g., Region 14, where P0 rises from 24.9% to 34.5%).
+
+Thus, although the national trend is robust across measures and poverty lines, subnational patterns are mixed, and poverty changes are not uniformly robust across space.")
+```
+
+## Q5. Contributions: where do the poor live?
+```{r q5, results='asis'}
+kable(stratum_contrib %>% arrange(year, desc(contrib_share)) %>%
+        mutate(contrib_share = percent(contrib_share, 0.1)),
+      caption="Stratum shares of national poor (standard line)") %>%
+  kable_styling(full_width = FALSE)
+
+kable(region_contrib %>% group_by(year) %>%
+        arrange(year, desc(contrib_share), .by_group = TRUE) %>%
+        slice_head(n=15) %>% ungroup() %>%
+        mutate(contrib_share = percent(contrib_share, 0.1)),
+      caption="Top 15 regions by share of national poor (standard line)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r echo=FALSE}
+
+cat("- Stratum-level contribution
+
+Rural areas still contain most of Tanzania’s poor, but their share falls from 63.6% to 55.1%. Urban areas, especially Dar es Salaam, increase their contribution (from 6.8% to 12.1%) because poverty rises there and population grows.
+Conclusion: national poverty becomes more urban in composition.
+
+- Region-level contribution
+
+The regions contributing most to national poverty change over time. In 2012, Regions 16, 10, and 9 dominate; by 2018, Regions 8, 14, and 16 take top positions.
+Conclusion: the geography of poverty shifts even as national poverty declines.
+
+- Headcount vs. contribution
+
+Regions with high poverty rates do not always contribute most to national poverty. Contribution depends on population × poverty rate.
+For example, Region 14 is not among the highest in P0 in 2012 but ranks highly in contribution due to its population size.
+Conclusion: headcount rankings and contribution rankings differ systematically.
+
+- Do conclusions vary over time?
+
+Yes. The largest contributors shift between years, and the relative importance of rural vs. urban poverty changes.
+Conclusion: spatial poverty patterns are dynamic; national averages hide this.")
+```
+
+## Q6. Overall policy recommendations
+```{r echo=FALSE}
+cat("The evidence suggests that poverty reduction in Tanzania has been modest and uneven, with substantial spatial variation in both incidence and contribution to national poverty. Based on these findings, the following policy priorities emerge:
+1. Target regions with persistently high poverty and slow improvement
+Regions such as 14, 15, and 16 show high poverty headcounts and remain among the largest contributors to national poverty. These areas should receive prioritized investments in rural infrastructure, agricultural productivity, and social protection.
+2. Address rising poverty in Dar es Salaam and other urban centers
+Despite lower initial poverty rates, Dar es Salaam’s poverty increased across all indicators, and its contribution to national poverty nearly doubled. Urban policies should focus on affordable housing, job creation in the informal sector, and managing rising living costs.
+3. Strengthen rural–urban poverty linkages
+Rural areas still contain more than half of Tanzania’s poor. Investments in rural roads, market access, irrigation, and mobile financial services can improve productivity and reduce vulnerability. At the same time, urban labor markets need to absorb rural–urban migrants effectively.
+4. Expand and retarget social protection programs
+Given the heterogeneity across regions and strata, safety nets should be geographically targeted toward lagging regions and vulnerable groups. Conditional and unconditional cash transfers can mitigate rising urban poverty and support rural households facing shocks.
+5. Monitor poverty with multiple indicators
+Differences across P0, P1, and P2 show that some areas improve in headcount but not in depth or severity. Policymakers should track all three measures to capture whether progress reaches the poorest of the poor.
+6. Align regional development budgets with poverty contribution
+Regions contributing the largest shares of Tanzania’s poor (e.g., 8, 14, 16) should receive proportionally higher allocations for health, education, and job-creating investments.")
 ```
