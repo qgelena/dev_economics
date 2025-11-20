@@ -1,0 +1,244 @@
+---
+title: "Tanzania Assignment 2"
+author: 'Group: Alona Sycheska'
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+library(haven)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(broom)
+library(ggplot2)
+```
+
+# 1. Load Data
+
+```{r}
+d18 <- read_dta("Tanzania_2018_new.dta")
+glimpse(d18)
+```
+
+# 2. Poverty Indicator
+
+```{r}
+d18 <- d18 %>% mutate(poor_nat = if_else(cons < povline, 1L, 0L))
+table(d18$poor_nat)
+```
+
+**Answer:**  
+A person is considered poor if `cons < povline`. This matches the national poverty line definition.
+
+# 3. Percent of Children in School (2018)
+
+```{r}
+d18_children <- d18 %>%
+  mutate(
+    loc = if_else(rural == 1, "Rural", "Urban"),
+    sex = if_else(male == 1, "Male", "Female"),
+    age_group = case_when(
+      age >= 7 & age <= 12 ~ "7-12",
+      age >= 13 & age <= 18 ~ "13-18",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(poor_nat == 1, !is.na(age_group), !is.na(inschool))
+
+tab_2018 <- d18_children %>%
+  group_by(loc, sex, age_group) %>%
+  summarise(enrol_2018 = 100 * weighted.mean(inschool == 1, w = hhweight, na.rm = TRUE))
+
+kable(tab_2018)
+```
+## Graph 1: Enrollment Rates in 2018 by Group
+
+```{r}
+ggplot(tab_2018, aes(x=sex, y=enrol_2018, fill=loc)) +
+  geom_col(position="dodge") +
+  facet_wrap(~age_group) +
+  labs(title="School Enrollment of Poor Children in Tanzania (2018)",
+       y="Enrollment Rate (%)",
+       x="Sex",
+       fill="Location") +
+  theme_minimal()
+```
+
+# 4. Comparison with Banerjee & Duflo (Table 9)
+
+```{r}
+tab_bd <- tibble::tribble(
+  ~loc, ~sex, ~age_group, ~enrol_2004,
+  "Rural","Female","7-12",51.2,
+  "Rural","Male","7-12",47.2,
+  "Urban","Female","7-12",66.4,
+  "Urban","Male","7-12",54.4,
+  "Rural","Female","13-18",53.3,
+  "Rural","Male","13-18",61.4,
+  "Urban","Female","13-18",51.8,
+  "Urban","Male","13-18",65.3
+)
+
+comp <- inner_join(tab_bd, tab_2018, by=c("loc","sex","age_group")) %>%
+  mutate(change_pp = enrol_2018 - enrol_2004)
+
+kable(comp)
+```
+
+## Graph 2: Change Over Time (2004 vs 2018)
+
+```{r}
+comp_long <- comp %>%
+  pivot_longer(cols=c(enrol_2004, enrol_2018), names_to="year", values_to="value")
+
+ggplot(comp_long, aes(x=sex, y=value, fill=year)) +
+  geom_col(position="dodge") +
+  facet_grid(loc ~ age_group) +
+  labs(title="School Enrollment: 2004 vs 2018",
+       x="Sex",
+       y="Enrollment (%)",
+       fill="Year") +
+  theme_minimal()
+```
+
+# Policy Note
+
+**Background:**  
+Enrollment among poor Tanzanian children has changed between early-2000s and 2018. The goal is to understand improvements and remaining gaps.
+
+**Key Findings:**  
+- Primary school (7–12) enrollment increased for all groups.  
+- Rural children still lag behind urban children, but the gap narrowed.  
+- Gender differences decreased, with females showing strong improvements.  
+- Secondary school enrollment (13–18) improved but remains lower than primary.
+
+**Interpretation:**  
+- Gains reflect national policies boosting primary education.  
+- Rural improvements may come from infrastructure investments.  
+- Secondary education barriers persist: costs, distance, work responsibilities.
+
+**Policy Recommendations:**  
+- Expand support for secondary education (books, uniforms, transport).  
+- Provide cash transfers for rural poor households.  
+- Support adolescent girls via targeted programs.
+
+# 5. RCT: Free Books
+
+```{r}
+rct <- d18 %>% 
+  filter(age >= 7, age <= 12) %>%
+  mutate(
+    loc = factor(if_else(rural == 1, "Rural","Urban")),
+    sex = factor(if_else(male == 1, "Male","Female"))
+  )
+
+rct_tab <- rct %>%
+  group_by(freebooks) %>%
+  summarise(enrol_later = 100 * weighted.mean(inschool_later == 1, w = hhweight, na.rm = TRUE))
+
+kable(rct_tab)
+```
+
+## Graph 3: RCT Treatment vs Control Enrollment
+
+```{r}
+ggplot(rct_tab, aes(x=factor(freebooks), y=enrol_later, fill=factor(freebooks))) +
+  geom_col() +
+  scale_x_discrete(labels=c("0"="Control","1"="Free Books")) +
+  labs(title="Impact of Free Books on Later Enrollment",
+       x="Group",
+       y="Enrollment (%)",
+       fill="Group") +
+  theme_minimal()
+```
+
+# 6. Regression Analysis
+
+## 6.1 Main Treatment Effect
+
+```{r}
+lm1 <- lm(inschool_later ~ freebooks, data=rct, weights=hhweight)
+kable(tidy(lm1))
+```
+
+### Interpretation  
+The intercept (0.902) means about 90.2% of children in the control group were enrolled in school later.
+
+The coefficient on freebooks = 0.0098 indicates:
+
+Children who received free books are 0.98 percentage points more likely to be enrolled later.
+
+The p-value (0.035) shows this effect is statistically significant at the 5% level.
+
+
+While the effect is statistically significant, it is small in magnitude.
+Free books helped, but the improvement is modest — under 1 percentage point.
+
+## 6.2 Controlled Regression
+
+```{r}
+lm2 <- lm(inschool_later ~ freebooks + age + sex + loc, data=rct, weights=hhweight)
+kable(tidy(lm2))
+```
+
+### Interpretation  
+When controlling for age, sex, and location:
+
+Free books
+
+Effect becomes 0.0082 (0.82 percentage points)
+
+No longer significant (p = 0.21)
+
+Interpretation: The program likely does not have a true causal effect once demographic factors are accounted for.
+
+Age
+
+Each additional year increases enrollment by 0.00448 (0.45 percentage points)
+
+Statistically significant (p = 0.0167)
+
+Sex (Male = 1)
+
+Boys are 1.50 percentage points less likely to be enrolled
+
+Significant (p = 0.0213)
+
+Urban location
+
+Urban children are 8.94 percentage points more likely to be enrolled
+
+Strongly significant (p < 0.0001)
+
+## 6.3 Graph: Predicted Probabilities
+
+```{r}
+rct$predicted <- predict(lm2)
+
+ggplot(rct, aes(x=factor(freebooks), y=predicted, fill=factor(freebooks))) +
+  geom_boxplot() +
+  scale_x_discrete(labels=c("0"="Control","1"="Free Books")) +
+  labs(
+    title="Predicted Enrollment from Regression Model",
+    x="Group",
+    y="Predicted Probability"
+  ) +
+  theme_minimal()
+```
+
+This graph shows differences in predicted enrollment between groups after adjusting for age, sex, and location.
+
+### RCT Policy Note
+
+**Answer:**  
+Free books alone do not meaningfully increase school attendance, though they may provide a small benefit. More impactful policies should target rural areas and boys’ enrollment.
+
+
